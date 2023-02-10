@@ -36,6 +36,7 @@ import java.util.function.Consumer;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.AssertHelpers;
 import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionSpec;
@@ -44,6 +45,8 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.SessionCatalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.NotFoundException;
+import org.apache.iceberg.exceptions.RESTException;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.jdbc.JdbcCatalog;
 import org.apache.iceberg.metrics.MetricsReport;
@@ -1504,5 +1507,87 @@ public class TestRESTCatalog extends CatalogTests<RESTCatalog> {
             eq(OAuthTokenResponse.class),
             eq(catalogHeaders),
             any());
+  }
+
+  @Test
+  public void testConnectionException() throws IOException {
+
+    TableIdentifier tableToCreate = TableIdentifier.of("ns", "testTable1");
+    RESTClient testClient =
+        new RESTCatalogAdapter(backendCatalog) {
+          @Override
+          public <T extends RESTResponse> T post(
+              String path,
+              RESTRequest body,
+              Class<T> responseType,
+              Map<String, String> headers,
+              Consumer<ErrorResponse> errorHandler) {
+            T response = super.post(path, body, responseType, headers, errorHandler);
+            String updateTablePath = new ResourcePaths(null).table(tableToCreate);
+            if (updateTablePath.equals(path)) {
+              // we only want to throw on simple update, not creations
+              // in this test table creation will go through CreateTableRequest instead
+              throw new RESTException("error");
+            }
+            return response;
+          }
+        };
+
+    RESTCatalog restCat = new RESTCatalog((config) -> testClient);
+    Map<String, String> initialConfig =
+        ImmutableMap.of(CatalogProperties.URI, "http://localhost:8080");
+
+    restCat.setConf(new Configuration());
+    restCat.initialize("prod", initialConfig);
+
+    // Create Table
+    Schema schema =
+        new Schema(
+            required(1, "id", Types.IntegerType.get(), "unique ID"),
+            required(2, "data", Types.StringType.get()));
+
+    PartitionSpec spec = PartitionSpec.builderFor(schema).bucket("id", 16).build();
+
+    Table table =
+        restCat
+            .buildTable(tableToCreate, schema)
+            .withPartitionSpec(spec)
+            .withProperties(null)
+            .create();
+
+    Assert.assertEquals(schema.toString(), table.schema().toString());
+
+    // Update Table
+    DataFile fileToAppend =
+        DataFiles.builder(spec)
+            .withPath("/path/to/data-a.parquet")
+            .withFileSizeInBytes(10)
+            .withPartitionPath("id_bucket=0") // easy way to set partition data for now
+            .withRecordCount(2) // needs at least one record or else metrics will filter it out
+            .build();
+
+    AssertHelpers.assertThrows(
+        "Update table post operation response failed to return",
+        RESTException.class,
+        "error",
+        () -> table.newFastAppend().appendFile(fileToAppend).commit());
+
+    // This proves that table object on the client side didn't update and thinks the commit failed
+    assertNoFiles(table);
+
+    // This proves that table object on the server side commit succeeded
+    Table reloadedTable = restCat.loadTable(tableToCreate);
+    Assert.assertTrue(reloadedTable.currentSnapshot() != null);
+    Map<String, String> summary = reloadedTable.currentSnapshot().summary();
+    Assert.assertEquals("1", summary.get("added-data-files"));
+
+    // but when planning files, it's gonna throw exception since the file doesn't exist
+    // because client side already deleted it
+    AssertHelpers.assertThrows(
+        "Client side already deleted the datafile",
+        NotFoundException.class,
+        () -> assertFiles(reloadedTable, fileToAppend));
+
+    restCat.close();
   }
 }
